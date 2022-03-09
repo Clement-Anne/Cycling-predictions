@@ -1,0 +1,1026 @@
+---
+title: "Cycling predictions using Machine Learning"
+author: "Clément ANNE"
+date: "08/03/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r preliminary_steps, echo=FALSE,include=FALSE}
+#Clear current environment
+rm(list=ls())
+
+###Libraries
+if(!require(rvest)) install.packages("rvest", repos = "http://cran.us.r-project.org")
+if(!require(stringr)) install.packages("stringr", repos = "http://cran.us.r-project.org")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(tinytex)) install.packages("tinytex", repos = "http://cran.us.r-project.org")
+
+
+library(rvest)
+library(stringr)
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(knitr)
+library(tinytex)
+
+
+###Working directory
+wd <- getwd()
+
+###Load datasets
+load(file.path("rda","race_infos.rda"))
+load(file.path("rda","point_scales.rda"))
+load(file.path("rda","results.rda"))
+load(file.path("rda","rider_infos.rda"))
+load(file.path("rda","rider_past_results.rda"))
+
+###Install tinytex if needed
+if(is_tinytex()==FALSE) tinytex::install_tinytex()
+```
+
+```{r fixing_nas, echo=FALSE, include=FALSE}
+#############################################
+#          2.1.1. Rider infos               #
+#############################################
+
+summary(dtb_rider_infos_clean)
+
+dtb_rider_infos_clean_woNAs <- dtb_rider_infos_clean%>%
+  mutate_at(c("Height","Weight"),as.numeric)%>%
+  mutate(mean_height=mean(Height,na.rm=TRUE))%>%
+  mutate(mean_weight=mean(Weight,na.rm=TRUE))%>%
+  mutate(Height=ifelse(is.na(Height),mean_height,Height))%>%
+  mutate(Weight=ifelse(is.na(Weight),mean_weight,Weight))%>%
+  select(-mean_weight,-mean_height)
+
+rm(dtb_rider_infos_clean)
+
+#############################################
+#          2.1.2. Race infos                #
+#############################################
+
+
+race_infos_2014_to_2021_clean%>%
+  mutate_all(is.na)%>%
+  summarize_all(sum)%>%
+  t()
+
+####Replace race infos
+#1. Replace by race_id level means
+#-ProfileScore: 29 NAs
+#-Vert meters: 33 NAs
+#-race profile: 22 NAs
+
+###Average features by race ID
+mean_race_features <- race_infos_2014_to_2021_clean%>%
+  select(ProfileScore,Vert_meters,race_profile,race_id,year)%>%
+  group_by(race_id)%>%
+  mutate_at(c("ProfileScore","Vert_meters"),mean,na.rm=TRUE)%>%
+  ungroup()%>%
+  select(race_id,ProfileScore,Vert_meters)%>%
+  filter(!is.na(ProfileScore) & !is.na(Vert_meters))%>%
+  rename(ProfileScore_common=ProfileScore)%>%
+  rename(Vert_meters_common=Vert_meters)%>%
+  distinct()
+
+###Most common race profile by race ID
+most_common_race_profile <- race_infos_2014_to_2021_clean%>%
+  filter(!is.na(race_profile))%>%
+  group_by(race_id,race_profile)%>%
+  mutate(count_race_profile=n())%>%
+  ungroup()%>%
+  group_by(race_id)%>%
+  mutate(most_common_race_profile_N=max(count_race_profile))%>%
+  filter(most_common_race_profile_N==count_race_profile)%>%
+  ungroup()%>%
+  select(race_id,race_profile)%>%
+  rename(race_profile_common=race_profile)%>%
+  distinct()
+
+#Temp dtb
+t <- race_infos_2014_to_2021_clean%>%
+  left_join(mean_race_features,by="race_id")%>%
+  left_join(most_common_race_profile,by="race_id")%>%
+  mutate(race_profile=ifelse(is.na(race_profile),race_profile_common,race_profile))%>%
+  mutate(Vert_meters=ifelse(is.na(Vert_meters),Vert_meters_common,Vert_meters))%>%
+  mutate(ProfileScore=ifelse(is.na(ProfileScore),ProfileScore_common,ProfileScore))
+
+###Special fix for the London Classic
+#-No info on Vert meters
+#-Info only once for the Profile Score (25)
+#-Consistent with the race profile (flat)
+#-We will estimate the average Vert Meter through loess
+###
+
+#Average profile score for the London classic
+mean_ProfileScore_London <- t%>%
+  filter(race_id=="ride-london-classic")%>%
+  summarize(mean(ProfileScore,na.rm = TRUE))%>%
+  pull()
+
+#Graph  
+t%>%
+  filter(race_id!="ride-london-classic")%>%
+  ggplot(aes(ProfileScore,Vert_meters))+
+  geom_point()+
+  geom_smooth(method=loess)
+
+#Loess estimate
+fit_Vert_meters <- with(t,loess(Vert_meters~ProfileScore))
+mean_Vert_meters_London <- predict(fit_Vert_meters,mean_ProfileScore_London)
+
+#Database without NAs
+race_infos_2014_to_2021_clean_woNAs <- t%>%
+  mutate(Vert_meters=ifelse(race_id=="ride-london-classic",as.numeric(mean_Vert_meters_London),Vert_meters))%>%
+  mutate(ProfileScore=ifelse(race_id=="ride-london-classic",as.numeric(mean_ProfileScore_London),ProfileScore))%>%
+  select(-ProfileScore_common,-race_profile_common,-Vert_meters_common)
+
+#Remove old or temporay files
+rm(t,most_common_race_profile,mean_race_features,fit_Vert_meters,
+   mean_ProfileScore_London,mean_Vert_meters_London)
+rm(race_infos_2014_to_2021_clean)
+```
+
+```{r load_recent_stats,echo=FALSE,include=FALSE}
+load(file.path("rda","rider_ability_stats2.rda"))
+
+```
+
+```{r var_names,echo=FALSE,include=FALSE}
+
+
+var_names <- variable.names(dtb_recent_stats2)
+
+###Career strength vars (9 vars)
+career_strength_vars <- var_names[str_detect(var_names,"\\_1?[a-zA-Z]{2,}$")==TRUE]
+
+###Form strength vars (3 vars)
+form_strength_vars_2w<- var_names[str_detect(var_names,"\\_2w$")==TRUE]
+form_strength_vars_3w<- var_names[str_detect(var_names,"\\_3w$")==TRUE]
+form_strength_vars_4w<- var_names[str_detect(var_names,"\\_4w$")==TRUE]
+form_strength_vars_5w<- var_names[str_detect(var_names,"\\_5w$")==TRUE]
+form_strength_vars_6w<- var_names[str_detect(var_names,"\\_6w$")==TRUE]
+form_strength_vars_7w<- var_names[str_detect(var_names,"\\_7w$")==TRUE]
+form_strength_vars_8w<- var_names[str_detect(var_names,"\\_8w$")==TRUE]
+
+###Status strength vars (9 vars)
+status_strength_vars_1y<- var_names[str_detect(var_names,"\\_1y$")==TRUE]
+status_strength_vars_2y<- var_names[str_detect(var_names,"\\_2y$")==TRUE]
+status_strength_vars_3y<- var_names[str_detect(var_names,"\\_3y$")==TRUE]
+status_strength_vars_4y<- var_names[str_detect(var_names,"\\_4y$")==TRUE]
+status_strength_vars_5y<- var_names[str_detect(var_names,"\\_5y$")==TRUE]
+
+```
+
+```{r wrangling_function,echo=FALSE,include=FALSE}
+
+###Function available only for form window [2-8w]
+# and status window [1-5y]
+my_wrangle_dataset <- function(f,s){
+  
+  form_window <- f
+  status_window <- s
+  
+  form_strength_vars <- case_when(form_window==2 ~ form_strength_vars_2w,
+                                  form_window==3 ~ form_strength_vars_3w,
+                                  form_window==4 ~ form_strength_vars_4w,
+                                  form_window==5 ~ form_strength_vars_5w,
+                                  form_window==6 ~ form_strength_vars_6w,
+                                  form_window==7 ~ form_strength_vars_7w,
+                                  form_window==8 ~ form_strength_vars_8w,)
+  
+  status_strength_vars <- case_when(status_window==1 ~ status_strength_vars_1y,
+                                    status_window==2 ~ status_strength_vars_2y,
+                                    status_window==3 ~ status_strength_vars_3y,
+                                    status_window==4 ~ status_strength_vars_4y,
+                                    status_window==5 ~ status_strength_vars_5y)
+  
+  
+  ###########
+  #   Step 1: Data aggregation
+  ###########
+  
+  
+  ###Here we make a temporary choice 4w form window and 3y status window
+  ### Will be relaxed and tuned later on
+  
+  ####Merging datasets
+  Merged_dtb <- dtb_results_2014_to_2021%>%
+    bind_cols(dtb_recent_stats2%>%select(all_of(career_strength_vars)))%>%
+    bind_cols(dtb_recent_stats2%>%select(all_of(form_strength_vars)))%>%
+    bind_cols(dtb_recent_stats2%>%select(all_of(status_strength_vars)))%>%
+    left_join(dtb_rider_infos_clean_woNAs,by="rider_id")%>% #Rider infos dataset
+    left_join(race_infos_2014_to_2021_clean_woNAs,by=c("race_id","year")) #Race infos dataset
+  
+  
+  ###########
+  #   Step 2: Wrangling
+  ###########
+  
+  ####Remaining non-numerical ranks
+  Merged_dtb%>%
+    filter(fight_finish==FALSE)%>%
+    pull(Rnk)%>%table() #OK (DNF,DSQ,OTL)
+  
+  #Main Y factor
+  table(Merged_dtb$Main_result) 
+
+  ###Sorted factor result
+  est_results <- factor(Merged_dtb$Main_result,
+                        levels = c("Fought for the win",
+                                   "Fought for the podium",
+                                   "Fought for the top 10",
+                                   "Active in the final",
+                                   "Finished the race",
+                                   "Did not finish"))
+  
+  ###Identify missing values in team ID
+  sum(is.na(Merged_dtb$team_id)) #5 missing team IDs
+  #Manual fixes using PCS website  
+  Merged_dtb_clean <- Merged_dtb%>%
+    mutate(team_id=ifelse(rider_id=="jean-pierre-drucker" &
+                            year==2014 &
+                            is.na(team_id),
+                          "wanty-groupe-gobert-2014",team_id),
+           team_id=ifelse(rider_id=="michael-schwarzmann" &
+                            year==2016 &
+                            is.na(team_id),
+                          "bora-argon-18-2016",team_id),
+           team_id=ifelse(rider_id=="sjoerd-van-ginneken" &
+                            year==2018 &
+                            is.na(team_id),
+                          "roompot-nederlandse-loterij-2018",team_id),
+           team_id=ifelse(rider_id=="matteo-bono" &
+                            year==2018 &
+                            is.na(team_id),
+                          "uae-team-emirates-2018",team_id),
+           team_id=ifelse(rider_id=="max-walscheid" &
+                            year==2021 &
+                            is.na(team_id),
+                          "team-qhubeka-assos-2021",team_id))
+  #Check
+  sum(is.na(Merged_dtb_clean$team_id)) #0 (Fixed)
+  
+  
+  #####Adding the number of teammates on the race
+  Merged_dtb_clean <- Merged_dtb_clean%>%
+    mutate(race_year_team_id=paste0(race_id,"/",year,"/",team_id))%>%
+    group_by(race_year_team_id)%>%
+    mutate(N_riders_race_team=n())%>%
+    ungroup()
+  
+  #####Adding the number of riders on the race
+  Merged_dtb_clean <- Merged_dtb_clean%>%
+    group_by(race_year_id)%>%
+    mutate(N_riders_race=n())%>%
+    ungroup()
+  
+  ##Dummy race nationality is the race rider
+  Merged_dtb_clean <-Merged_dtb_clean%>%
+    mutate(race_rider_nationality=ifelse(rider_nation==nationality,TRUE,FALSE))
+  prop.table(table(Merged_dtb_clean$race_rider_nationality)) #19%
+  
+  ###Last BIB number is 1 "Unofficial leader"
+  Merged_dtb_clean <-Merged_dtb_clean%>%
+    mutate(BIB_finishby1=ifelse(str_ends(as.character(BIB),"1"),TRUE,FALSE))
+  prop.table(table(Merged_dtb_clean$BIB_finishby1)) #13%
+  
+  ###Professional experience
+  Merged_dtb_clean <-Merged_dtb_clean%>%
+    mutate(professional_exp=as.numeric(Date-professional_since)/365.25)
+  
+  ###Accurate age
+  Merged_dtb_clean <-Merged_dtb_clean%>%
+    mutate(age_acc=as.numeric(Date-Date_of_birth)/365.25)
+  
+  ###Add race-year-team ID (for stats at the team level at the start of eachs race)
+  Merged_dtb_clean <-Merged_dtb_clean%>%
+    mutate(race_year_team_id=paste0(race_id,"/",year,"/",team_id))
+  
+  ###N_riders_race: Number of riders at the start
+  Merged_dtb_clean <-Merged_dtb_clean%>%
+    group_by(race_year_id)%>%
+    mutate(N_riders_race=n())%>%
+    ungroup()
+  
+  ###Variables in numeric form
+  Merged_dtb_clean <- Merged_dtb_clean%>%
+    mutate_at(c("Distance","Weight","Height"),as.numeric)
+  
+  ###########
+  #   Step 3: Removing useless variables
+  ###########
+  
+  Merged_dtb_clean <- Merged_dtb_clean%>%
+    select(-BIB,-Rider,-Age,-Team,-UCI,-Minute_gap,-Second_gap,-rider_nation,
+           -Date_of_birth,-Nationality,-Place_of_birth,-professional_since,
+           -Passed_away_on,-max_date,-Date,-nationality)
+  
+  ###########
+  #   Step 4: Stength variables
+  ###########
+
+  strength_vars <- c(career_strength_vars,form_strength_vars,status_strength_vars)
+
+  ####Team strength
+  replace_suffix <- function(string){str_replace(string,"_\\d{1}[yw]","")}    
+  form_suffix <- paste0(as.character(f),"w")
+  status_suffix <-   paste0(as.character(s),"y")
+  
+  ####Compute team strength
+  Team_strength <- Merged_dtb_clean%>%
+    group_by(race_year_team_id)%>%
+    transmute_at(vars(all_of(strength_vars)),sum)%>%
+    rename_at(vars(contains("status")),replace_suffix)%>%
+    rename_at(vars(contains("form")),replace_suffix)%>%
+    mutate(N_riders=n())%>%
+    ungroup()%>%
+    select(-race_year_team_id)%>%
+    rename_all(paste0,"_team")
+  
+  ####Compute rank within team ("status in the team")
+  Team_status <- Merged_dtb_clean%>%
+    group_by(race_year_team_id)%>%
+    transmute_at(vars(all_of(strength_vars)),scale)%>% ####Scale strength vars at the race-year-team level!
+    ungroup()%>%
+    select(-race_year_team_id)%>%
+    rename_all(paste0,"_teamstatus")
+
+  ###Merging dataset
+  Merged_dtb_clean2 <- Merged_dtb_clean%>%
+    bind_cols(Team_strength,Team_status)
+  
+  
+  ###########
+  #   Step 5: Variable selection
+  ###########
+
+  ####################Y variables
+  
+  variables_y <- c("Main_result",
+                   "fight_win",
+                   "fight_podium",
+                   "fight_top10",
+                   "fight_active",
+                   "fight_finish")
+
+  ####################X variables
+  
+  variables_x_rider <- c("age_acc", #Scale at the race level
+                         "professional_exp", #Scale at the race level
+                         "Weight", #Scale at the race level
+                         "Height") #Scale at the race level
+
+  variables_x_rider_teamstatus_t <- variable.names(Team_status) #Already scaled at the race-team level
+  variables_x_rider_strength_t <- strength_vars #Scale at the race level
+  variables_x_rider_t <- c(variables_x_rider_teamstatus_t,variables_x_rider_strength_t)
+  
+  variables_x_team_t <- variable.names(Team_strength) #Scale at the race level
+  
+  variables_x_race_t <- c("Distance", #Scale at the dtb level
+                          "Points_scale",  #Not scaled
+                          "ProfileScore",  #Scale at the dtb level
+                          "Vert_meters", #Scale at the dtb level
+                          "race_profile", #Not scaled
+                          "N_riders_race", #Scaled at the dtb level
+                          "day_id", #Scale at the dtb level
+                          "race_rider_nationality")  #Not scaled
+
+  variables_x <- c(variables_x_rider,
+                   variables_x_rider_t,
+                   variables_x_team_t,
+                   variables_x_race_t)
+  
+  variables_id <- c("rider_id","race_year_id","race_year_team_id")
+  
+  ###########
+  #   Step 6: Scaling variables
+  ###########
+  
+  Merged_dtb_clean2%>%
+    #Variables scaled at the dtb level
+    mutate_at(c("Distance","ProfileScore","Vert_meters","N_riders_race","day_id"),scale)%>%
+    group_by(race_year_id)%>%
+    mutate_at(all_of(variables_x_rider),scale)%>%
+    mutate_at(all_of(variables_x_rider_strength_t),scale)%>%
+    mutate_at(all_of(variables_x_team_t),scale)%>%
+    ungroup()%>%
+    select(all_of(variables_y),all_of(variables_x),all_of(variables_id))%>%
+    relocate(all_of(variables_y),all_of(variables_x),all_of(variables_id))
+}
+```
+
+```{r vars_id,echo=FALSE,include=FALSE}
+  variables_id <- c("rider_id","race_year_id","race_year_team_id")
+```
+
+
+# 1. Introduction
+
+With the increasing number of sports statistics publicly available, machine learning has become a popular tool to develop algorithms aiming at predictions outcomes of sports events. While some sports such as basketball, baseball, or soccer has seen a development of advanced statistics and prediction models over time, such developments have not reached road cycling to the same extend.
+
+In fact, cycling races seem more challenging to predict since the prediction output should rank all starting riders instead of predicting a binary or limited-class output such as win-loss-draw.
+
+To fill this void, I relied on web scrapping to extract publicly available cycling data from the <https://www.procyclingstats.com.> My aim is to develop a machine learning algorithm to predict outcomes from one-day World Tour races over 2014-2021.
+
+World Tour races are the top races in the world cycling calendar, which are expected to bring the highest level of competition. As a first machine learning algorithm developed to cycling race data, I chose to restrict the focus to one-day races to limit the noise in stage results from multi-stage races arising from general classification strategies (e.g., teams not chasing back breakaways having no fearful riders for the general classification in latter stages).
+
+The resulting sample consists of 130 one-day World Tour races over 2014-2021. 
+
+One major contribution of this analysis relied in the development of an algorithm cleaning each race results data by grouping riders finishing within similar time gaps from the winner, into categories (fought for the win, fought for the podium, fought for the top 10, was active in the final, fought to finish, did not finish). This approach aims at bringing predictions more relevant than simple rank predictions. 
+
+As a first step in cycling predictions, this analysis focuses on predicting riders fighting for the top 10 in those 130 one-day World Tour cycling races over 2014-2021.
+
+Following section will present the methodology applied for this analysis.
+
+# 2. Methodology
+
+## 2.1. Data source
+
+This analysis relies exclusively on data scrapped from the <https://www.procyclingstats.com> website. Extracted data contain:
+
+-**Race results** for the 130 one-day World Tour races over 2014-2021 including the time gap from the winner, the BIB number, and the team.
+
+-**Race level information** (distance, difficulty rating (Profile Score from the <https://www.procyclingstats.com> website), vertical meters climbed, date in the annual calendar, number of riders).
+
+-**Rider level information** (age, experience, height, weight).
+
+-**Extensive results from each rider's career** at the time of each race start. I limited data extraction to all races prior to the last one-day World Tour race in our dataset. 
+
+## 2.2. Cleaning race results
+
+### 2.2.1. Grouping riders in race results
+
+One innovation of this analysis relies in the identification of groups of riders inside race results to derive outcomes.
+
+If a time gap below 10 seconds remains between 2 subsequent groups of riders, we group them and assign the time gap of the biggest group. We apply these corrections as long as a gap below 10 seconds remain between subsequent groups. This enables grouping riders which finished close from a main group for various reasons (e.g., A rider not wanting to sprint after helping a teammate). 
+
+### 2.2.2. Identifying race outcomes
+
+After those corrections, we derive some binary outcomes catching the result for those groups:
+
+-**Fought for the win**: In case the winner was in this group
+
+-**Fought for the podium**: In case the better classified rider in this group finished on the podium
+
+-**Fought for the top 10**: In case the better classified rider in this group finished in the top 10. I chose the top 10 cut-off since it is the standing appearing on TV at the end of the race, thus proving extra motivation to reach the top 10.
+
+-**Was active in the final**:  In case the better classified rider in this group finished in the top 30. I chose the top 30 cut-off since the number of UCI (alternatively PCS) points earned becomes marginal at this point. Besides, it should catch riders performing well but not enough to fight for accessits or teammates having significantly helped their leader(s).
+
+-**Fought to finish the race**: In case the better classified rider in this group finished beyond the top 30. It aims at controlling for riders with a will to finish the race despite having nothing else to fight for. Unlike general classification races, one-day races are all of nothing events so that some riders may be more willing than others to finish it in case they could not play a significant role in the final portion of the race.
+
+-**Did not finished**: In case the rider did not finish the race.
+
+The figure below provides the gap distribution from the winner depending on the final rank. We can evidence that the median values increase by steps which correspond to some of the groups we defined.
+
+```{r rank_results,echo=FALSE}
+###Time gap top 50  
+dtb_results_2014_to_2021%>%
+  filter(Rnk!="DSQ" & Rnk!="DNF" & Rnk!="OTL")%>%
+  mutate_at("Rnk",as.numeric)%>%
+  select(Rnk,Time_seconds)%>%
+  filter(Rnk<=50)%>%
+  ggplot(aes(factor(Rnk),Time_seconds))+
+  geom_boxplot()+
+  scale_y_sqrt()+
+  xlab("Rank")+
+  ylab("Seconds gap from the winner")+
+  ggtitle("Time gap depending on race rank")
+
+```
+
+The analysis of PCS point depending on point scale highlights that riders beyond the 30th place only gain marginal points. However, focusing on the top 10 seems a more conservative approach for a first analysis since some riders may have different incentives of fighting for the 10-30 ranks. 
+
+
+
+```{r,echo=FALSE}
+scales_list_2014_to_2021_clean%>%
+  filter(year==2021)%>%
+  filter(Result<=50)%>%
+  ggplot(aes(factor(Result),Points,color=Points_scale))+
+  geom_point()+
+  scale_y_sqrt()+
+  theme(axis.text.x = element_text(angle=90,hjust=1))+
+  xlab("Result")+
+  ggtitle("PCS points earned depending on point scale")
+```
+
+
+
+
+### 2.2.3. Example of cleaned race outcome
+
+To illustrate those corrections, table below represents the corrected standing among the top 50 riders from il Giro di Lombardia 2016.
+
+```{r echo=FALSE}
+###Cleaned results from Lombardia 2016
+example_lombardia2016 <- dtb_results_2014_to_2021%>%
+  filter(race_id=="il-lombardia" & year==2016)%>%
+  select(Rnk,Rider,Time_seconds,Time_seconds_fixed,fight_win,fight_podium,fight_top10,fight_active)%>%
+  .[1:35,]%>%
+  rename(Gap_secs=Time_seconds,
+         Gap_secs_fixed=Time_seconds_fixed)
+kable(example_lombardia2016)
+```
+
+
+
+## 2.3. Assessing rider ability using previous race outputs
+
+Race outcomes may depend significantly on riders abilities. While it is almost impossible to gauge riders abilities, this analysis focuses on past results to derive ability (or strength) related variables.
+
+Those variables are divided into 3 categories:
+-**Recent form**: They should catch the form of the rider over the most recent races.
+
+-**Status in the peloton**: Those variables aim at capturing the status of a given rider because of his recent results.
+
+-**Career achievements**: They sum up the career stats of the rider.
+
+The 2 latter categories (status and career) are further split into 4 categories:
+
+-**Stats related to the oncoming race**: Statistics related to former participations of the oncoming race (e.g., Paris-Roubaix)
+
+-**Stats related to past 1 day World Tour races**: Statistics related to former participations of 1 day World Tour races. It should capture experience and ability specific to those races. I limited those races to former edition of each of the 21 races appearing at least once in the dataset.
+
+-**Overall stats**: Statistics related to all races
+
+We rely on 2 information of past race achievements for all the abovementioned categories:
+
+-**The number of raced days** (e.g., a multistage race would account for 1 raced day for each stage)
+
+-**The sum of ProCyclingStats points (PCS)** earned
+
+ProCyclingStats points (PCS hereafter) are an alternative to World Tour and/or UCI points earned. In fact World Tour point system changed over time, so that PCS provides a better alternative consistent across time to evaluate riders performance.
+
+It should be noted that PCS points are earned for any race achievements, with more points being earned for better results and on more prestigious races.
+
+The 14 resulting variables are described in the following subsections.
+
+### 2.3.1. Recent form and the form window
+
+Variables related to the recent form should catch the rider's form when coming to a given race.
+
+In fact, riders are not at their peak level all year long and may target specific objectives in the calendar.
+
+Thus, a rider may perform better when he is coming from more races or at least with better results.
+
+To capture those effect, we compute the variables described previously (number of raced days and sum of PCS points) on a form window.
+
+Form window (fw) is a tuning parameter and we will test values from 2 to 6 weeks.
+
+
+### 2.3.2. Status in the peloton and the status window
+
+We aim at capturing the status in the peloton for a given status window sw through the following variables:
+
+-Achievements over 1-day World Tour races during status window sw (number of raced days and sum of PCS points) 
+-Achievements on this oncoming race during status window sw (number of raced days and sum of PCS points)
+-Achievements over all races during status window sw (number of raced days and sum of PCS points)
+
+Status window is also a tuning parameter and we will test values from 3 to 5 years.
+
+### 2.3.3. Career achievements
+
+We aim at capturing career achievements through the following variables:
+
+-Career achievements over 1-day World Tour races (number of raced days and sum of PCS points) 
+-Career achievements on this oncoming race (number of raced days and sum of PCS points) 
+-Career achievements over all races (number of raced days and sum of PCS points) 
+
+It seems important to distinguish status in the peloton from career achievements as some riders past their prime years would have few top results over the recent years while having great results way back in time.
+
+## 2.4. Deriving team strength 
+
+Cycling is a team sport for which it is not easy to capture team-level features.
+
+Teams differ according to their finances, their material, their material, and their training, which may differ 
+
+It is difficult to track teams across times since they often change sponsors, which may bring staff or structure changes (e.g., In case of the arrival of a foreign sponsor).
+
+Thus, I relied on a second-best approach to gauge team strength by summing up the rider strength variables at the team level among riders of the same team at the beginning of each race.
+
+A previous version of this analysis included also the deviation of rider strength variables within his team at the beginning of the race to account for the potential overflow of talent in top teams, which would prevent some talented riders from contending freely for top ranks.
+
+However, it would complicate the model further since teams with few to none experience (e.g., invited teams) may be tricky to extract a team status for each rider. As such, I postponed this inclusion for further developments.
+
+
+## 2.5. Machine learning methodology
+
+### 2.5.1. Data partition
+
+```{r,echo=FALSE,include=FALSE}
+#####Because of the data structure, 
+# we split the dataset depending on the race-year IDs
+
+###Seed set 2022-3-3=2016
+set.seed(2016,sample.kind="Rounding")
+test_set_races <-  race_infos_2014_to_2021_clean_woNAs$race_year_id[createDataPartition(1:130,times=1,p=0.2,list=FALSE)]
+train_set_races <- race_infos_2014_to_2021_clean_woNAs$race_year_id[!race_infos_2014_to_2021_clean_woNAs$race_year_id%in%test_set_races]
+
+
+###Folds for Cross Validation 5-fold CV
+set.seed(2016,sample.kind="Rounding")
+CV_races_id <- createFolds(train_set_races,k=5,list=TRUE)
+
+
+```
+
+
+The final dataset consists of 22539 rider-race level observation for the 130 races covered in this analysis. To train a machine learning algorithm I split the data according to their race ID, which randomly assigned 28 races (approximately 20% of races) to a test set and 102 races to the training set.
+
+The performance of the algorithm will only be assessed on the 28 races in the test set after being trained exclusively over the 102 races in the training set. 
+
+It seems to mimic better the aim of this algorithm which is to predict race outcomes given observable features at the start of the race. As such, it seems preferable over splitting the whole dataset depending on the race outcome (fighting for the top 10 in our case).
+
+### 2.5.2. Preprocessing data
+
+The following transformations have been applied:
+
+-**Rider level information** has been scaled among each race participants so that the variables are relative to the start list.
+
+-**Race level variables** have been scaled across all the dataset to catch relative specificities across them.
+
+-**Team strength variables** have been scaled across each race to represent the relative importance of teams inside the peloton for a given race.
+
+
+### 2.5.3. Models
+
+
+**Model 1: Knn without matrix factorization**
+
+
+We consider both the status and form windows presented in section 2.3 as tuning parameters since they should catch the rider/team ability at the start of the race. 
+
+This analysis being the first in the direction of predicting race outcomes in cycling, it focuses on predicting riders fighting for the top 10.
+
+For this task, I relied on kNN (k nearest neighbors) modelling. 
+
+This model applied on binary outcomes computes the average probability of the outcome among the observations with the closest features according to the variables used in the model.
+
+Those closest observation points used depend on the paramt
+
+
+**Model 2: Knn with matrix factorization**
+
+
+This analysis tried to bring extensive data related to rider/team abilities through the indicators presented in the previous sections. One drawback of this approach is to use highly correlated variables. 
+
+In fact, we may expect some correlation between the number of races and the sum of PCS points. Likewise, we may observe significant correlation between team strength and rider abilities.
+
+To limit this problem, I relied on matrix factorization through Principal Component Analysis (PCA hereafter) before applying the KNN model.
+
+Principal component disentangle the matrix of predictors into uncorrelated factors of decreasing importance. It aims at preventing high correlation among predictors while also limiting the dimension of predictors.
+
+We select the number of principal components up to representing 95% of the variation from the initial matrix of determinants.
+
+
+
+### 2.5.4. Selection of tunning parameters
+
+I used cross-validation on the training set to tune model parameters. To do so, I relied on 5-fold cross-validation by randomly splitting races from the training set into 5 groups.
+
+For each of those 5 groups, I run estimates on each version of the training set after exclusion of this group before assessing on this excluded group. Then model performance indicators are averaged across those 5 model computations.
+
+This process is repeated for each parameter and those parameters are selected when they maximize the model performance indicators.
+
+Tuning parameters include:
+
+-**Form window**: From 2 to 6 weeks
+
+-**Status window**: From 3 to 5 years
+
+-**Number of neighbors (k)**: For the kNN model. 
+
+
+### 2.5.5. Measuring model performance
+
+This analysis aims at predicting whether a given rider at the start of a race would finish at different echelons. 
+
+In our case, having a low sensitivity would prevent us from predicting enough riders in the corresponding group( e.g., classifying a rider as fighting for the win while he actually did not).
+
+Likewise, having a low specificity would mean the algorithm fails to detect riders finishing in the corresponding group (e.g., classifying a rider as not fight for the win while he actually did). 
+
+It seems that both error types are equally costly, so we can rely on the F1-score to select the best tuning parameters for the algorithm trained on the training set. By weighting both sensitivity and specificity through the harmonic average, it should be a more balanced measure than accuracy.
+
+F1-score seems even more relevant that the probability of fighting for the top 10 has a relatively low prevalence so that accuracy could be a misleading indicator.
+
+## 2.6. Data exploration
+
+The following graph represents the distribution of race outcomes across races in the training set. We can evidence that fighting for the top 10 remains a low prevalence event with the interquartile range being below 25%. 
+
+
+```{r race_outcomes,echo=FALSE,include=FALSE}
+
+Working_dataset <- my_wrangle_dataset(6,3)%>%
+  filter(race_year_id%in%train_set_races) #Equivalent to train set
+
+###Proportion outcomes within each race
+mean_results <- Working_dataset%>%
+  group_by(race_year_id)%>%
+  transmute_at(c("fight_win","fight_podium",
+                 "fight_top10","fight_active",
+                 "fight_finish"),mean)%>%
+  distinct()%>%
+  ungroup()
+
+mean_results%>%
+  summarize_at(-1,median)%>%t()
+
+```
+
+```{r,echo=FALSE}
+mean_results%>%
+  pivot_longer(-1,names_to = "Prop_dummy_name",
+               values_to = "Prop_dummy")%>%
+  mutate(Prop_dummy_name=reorder(Prop_dummy_name,Prop_dummy,FUN=median))%>%
+  ggplot(aes(Prop_dummy_name,Prop_dummy))+
+  geom_boxplot()+
+  coord_flip()+
+  xlab("")+
+  ylab("% riders")+
+  ggtitle("Race outcomes")
+```
+
+The following graph evidence the same distribution across races in the training set.
+
+```{r,echo=FALSE}
+mean_results%>%
+  mutate(race_id=str_split(race_year_id,"/",simplify = TRUE)[,1]%>%factor())%>%
+  pivot_longer(2:6,names_to = "Prop_dummy_name",
+               values_to = "Prop_dummy")%>%
+  mutate(Prop_dummy_name=Prop_dummy_name%>%
+           factor(levels=c("fight_win","fight_podium","fight_top10",
+                           "fight_active","fight_finish")))%>%
+  mutate(race_id=reorder(race_id,Prop_dummy,median))%>%
+  ggplot(aes(race_id,Prop_dummy))+
+  facet_wrap(~Prop_dummy_name)+
+  geom_boxplot()+
+  coord_flip()+
+  xlab("")+
+  ggtitle("Outcomes by race")
+```
+
+
+One limitation of this current analysis is the mix of races which have different features bringing different scenarii. While some race level determinants have been added in the models (race profile, distance, vertical meters), we cannot rule out that some race-specific features would remain.
+
+However, focusing on riders fighting for the top 10 seems less prone to this bias compared with riders fighting for the win, since the heterogeneity is slightly lower.
+
+# 3. Results
+
+```{r loading_results,echo=FALSE,include=FALSE}
+load(file.path("rda","final_results.rda"))
+
+```
+
+This section presents the results obtained for predicting riders fighting for the top 10 in World Tour 1-day races across 2014-2021.
+
+Better predictions are obtained while using a narrower status window for assessing the status in the peloton, since the performance improves with a window of 3 years. Results depending on the form window are more blurred.
+
+Results related to model bring a relatively low F1 score which is maximized on lower values on k. It may seem counter-intuitive but it seems better to rely on the model using low value of k since it helps.
+
+```{r,echo=FALSE}
+###Model 1
+results%>%
+  filter(Model=="KNN without PCA")%>%
+  mutate(sw_fw=paste0("sw",as.character(Status_window),"_","fw",as.character(Form_window)))%>%
+  ggplot(aes(k,F1_score,color=sw_fw))+
+  geom_point()+
+  geom_line()+
+  ggtitle("F1 score for Model 1")+
+  ylab("F1 score")
+```
+
+This pattern could be observed while plotting the same graph for accuracy. Using accuracy we would have prefered a higher number of neighbors k, but it would have been at the cost of a lower sensitivity which motivates our reliance on the F1 score.
+
+```{r,echo=FALSE}
+results%>%
+  filter(Model=="KNN without PCA")%>%
+  mutate(sw_fw=paste0("sw",as.character(Status_window),"_","fw",as.character(Form_window)))%>%
+  ggplot(aes(k,accuracy,color=sw_fw))+
+  geom_point()+
+  geom_line()+
+  ggtitle("Accuracy for Model 1")
+```
+
+Our second model using matrix factorization brings better results with higher F1 scores. The better performing model is obtained for k=5 neighbors over a status window of 3 years and a form window of 6 weeks.
+
+```{r model2_graph,echo=FALSE}
+###Model 2
+results%>%
+  filter(Model=="Knn with PCA")%>%
+  mutate(sw_fw=paste0("sw",as.character(Status_window),"_","fw",as.character(Form_window)))%>%
+  ggplot(aes(k,F1_score,color=sw_fw))+
+  geom_point()+
+  geom_line()+
+  ggtitle("F1 score for model 1")
+```
+
+
+The following graph confirms the importance of relying on F1 score, since the accuracy would have been a misleading performance indicator.
+
+```{r model2_accuracy,echo=FALSE}
+###Graph according to accuracy
+results%>%
+  filter(Model=="Knn with PCA")%>%
+  mutate(sw_fw=paste0("sw",as.character(Status_window),"_","fw",as.character(Form_window)))%>%
+  ggplot(aes(k,accuracy,color=sw_fw))+
+  geom_point()+
+  geom_line()+
+  ggtitle("Accuracy for model 2")
+```
+
+
+```{r opt_model_def,echo=FALSE,include=FALSE}
+optimal_model <- results%>%
+  filter(F1_score==max(F1_score))
+
+results%>%
+  filter(Model=="KNN without PCA")%>%
+  filter(F1_score==max(F1_score))%>%
+  t()
+
+optimal_model <- results%>%
+  filter(F1_score==max(F1_score))
+```
+
+Table below represents the parameters and performance related to the best performing model during the training process on the training set.
+
+```{r opt_model,echo=FALSE}
+options(digits=3)
+
+optimal_model%>%
+  relocate(Model,k,Form_window,Status_window,F1_score,accuracy,
+        sensitivity,specificity)%>%
+  kable()
+
+```
+
+We use those parameters and apply them on the test set to gauge the real performance of our model. For comparison sake we use those same parameters on model 1 without matrix factorization even though we know it performs worse.
+
+```{r result_process,echo=FALSE,include=FALSE}
+
+Working_dataset <- my_wrangle_dataset(optimal_model$Form_window,
+                                      optimal_model$Status_window)
+
+#####
+#                                                
+#  Step 1: Data partition                
+#                                                
+#####
+
+
+Working_dataset2 <- Working_dataset%>%
+  select(-N_riders_team)%>%
+  select(-ends_with("teamstatus"))%>% #Remove team status vars
+  select(-Main_result,-fight_podium,-fight_win,
+         -fight_active,-fight_finish)%>% #Remove other outputs
+  mutate(fight_top10=factor(fight_top10,levels=c(TRUE,FALSE)))%>%
+  select(-Points_scale,-race_rider_nationality) #Remove factors
+
+sum(is.na(Working_dataset2))
+Working_dataset2%>%
+  mutate_all(is.na)%>%
+  summarize_all(sum)%>%
+  t()
+
+train_set_id <- Working_dataset2%>%
+  filter(race_year_id%in%train_set_races)%>%
+  select(all_of(variables_id))
+
+test_set_id <- Working_dataset2%>%
+  filter(race_year_id%in%test_set_races)%>%
+  select(all_of(variables_id))
+
+train_set <- Working_dataset2%>%
+  filter(race_year_id%in%train_set_races)%>%
+  select(-all_of(variables_id))
+test_set <- Working_dataset2%>%
+  filter(race_year_id%in%test_set_races)%>%
+  select(-all_of(variables_id))
+
+
+#####
+#                                                
+#  Step 2: knn model w/o pca              
+#                                                
+#####
+
+#KNN estimate
+knn_fit_opt1 <- knn3(fight_top10~.,k=optimal_model$k,data=train_set)
+#Prediction
+y_hat_opt1 <- predict(knn_fit_opt1,test_set,type="class")
+
+cm_opt1 <- confusionMatrix(y_hat_opt1,test_set$fight_top10)
+F1score_opt1 <- F_meas(y_hat_opt1,test_set$fight_top10)
+
+results_opt1 <- tibble(Model="Knn without PCA",
+                       k=optimal_model$k,
+                       Form_window=paste0(as.character(optimal_model$Form_window)," weeks"),
+                       Status_window=paste0(as.character(optimal_model$Status_window)," years"),
+                       F1_score=F1score_opt1,
+                       accuracy=cm_opt1$overall["Accuracy"],
+                       sensitivity=cm_opt1$byClass["Sensitivity"],
+                       specificity=cm_opt1$byClass["Specificity"])
+
+
+
+#####
+#                                                
+#  Step 3: knn model w/ pca              
+#                                                
+#####
+
+pca_train_opt <- prcomp(train_set[,-1])
+
+summary(pca_train_opt)$importance%>%
+  as_tibble()%>%
+  .[3,]%>%
+  pivot_longer(everything(),values_to = "Prop",names_to="PCA_name")%>%
+  mutate(PCA_name=str_replace(PCA_name,"PC","")%>%as.numeric())%>%
+  ggplot(aes(PCA_name,Prop))+
+  geom_point()+
+  geom_line()
+
+###Min number of PCAs to represent at least 95% variation
+PCA_number <- summary(pca_train_opt)$importance%>%
+  as_tibble()%>%
+  .[3,]%>%
+  pivot_longer(everything(),values_to = "Prop",names_to="PCA_name")%>%
+  mutate(PCA_name=str_replace(PCA_name,"PC","")%>%as.numeric())%>%
+  filter(Prop>=0.95)%>%
+  summarize(min=min(PCA_name))%>%
+  pull(min) #22
+
+###Threshold
+summary(pca_train_opt)$importance[,PCA_number] #95.6%
+
+###Train set with PCA vectors
+train_set_pca_opt <- bind_cols(fight_top10=train_set$fight_top10,
+                               pca_train_opt$x[,1:PCA_number])
+
+#Temporary X variables in test set
+x_test_set_temp_opt <- test_set[,-1]
+#Column means of X
+col_means_x_test_opt <- colMeans(x_test_set_temp_opt)
+#Apply PCA rotation
+x_test_set_opt <- as.matrix(sweep(x_test_set_temp_opt, 2, col_means_x_test_opt)) %*% pca_train_opt$rotation
+
+test_set_pca_opt <- bind_cols(fight_top10=test_set$fight_top10,
+                          x_test_set_opt[,1:PCA_number])
+
+
+
+#####KNN estimate
+knn_fit_pca_opt <- knn3(fight_top10~.,k=optimal_model$k,data=train_set_pca_opt)
+#Prediction
+y_hat_pca_opt <- predict(knn_fit_pca_opt,test_set_pca_opt,type="class")
+
+cm_opt2 <- confusionMatrix(y_hat_pca_opt,test_set_pca_opt$fight_top10)
+F1score_opt2 <- F_meas(y_hat_pca_opt,test_set_pca_opt$fight_top10)
+
+
+results_opt2 <- tibble(Model="Knn with PCA",
+                       k=optimal_model$k,
+                       Form_window=paste0(as.character(optimal_model$Form_window)," weeks"),
+                       Status_window=paste0(as.character(optimal_model$Status_window)," years"),
+                       F1_score=F1score_opt2,
+                       accuracy=cm_opt2$overall["Accuracy"],
+                       sensitivity=cm_opt2$byClass["Sensitivity"],
+                       specificity=cm_opt2$byClass["Specificity"])
+
+```
+
+```{r table_result, echo=FALSE}
+options(digits=3)
+results_opt1%>%
+  bind_rows(results_opt2)%>%
+  kable()
+```
+
+The better performing model featuring KNN with matrix factorization provides a F1-score of 0.407. The sensitivity remains a bit low at 0.335 but it improves significantly from the model without matrix factorization.
+
+# 4. Conclusion
+
+This analysis remains a first step in the development of a machine learning algorithm to predict road cycling race outputs. It provides an innovative way to classify riders' results into group outputs which better represents the race scenario than final ranks.
+
+Using a KNN model with matrix factorization thanks to Principal Component Analysis brings promising results, since it predicts riders fighting for the top 10 with a F1 score of 0.4.
+
+I should acknowledge that the ability indices used for this analysis could be improved using kernels or smoothers to give a higher weight to more recent performances inside the form or status windows. However, the solution may not be straightforward since riders do not race at every point in time, or may even not race at all in case of their season start.
+
+Besides, the reliance on PCS points may blur the real performances which could have been more salient from grouping riders for each race as we did (e.g., overestimating a rider's ability which is steadily in the top 10-20 but will struggle having better results). A more time-consuming alternative bringing the race result correction to all past results may help gauge better rider performance.
+
+Further work seems needed with modeling with other approaches such as the random forest model.
+
+Complementary analyses would focus on predicting other races outcomes (e.g., fighting for the win) as a follow-up to this analysis.
+
+A future development (after developing models for the prediction of each race outcome) would be to develop estimates of the relative sprinting abilities among riders predicted in each group. One way to do this could be to rely on former head-to-head matchups and the group size to predict an order among the groups of riders fighting for at least a top 10. As currently exploited for this analysis, abilities proxied by PCS scores may also overestimate sprinter ability as they tend to have higher PCS scores.
+
+
